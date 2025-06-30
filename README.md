@@ -18,7 +18,8 @@
 - Moves inserted vertices toward their weighted circumcenters
 
 ## Call Example
-```
+```cpp
+#include "iODT.hpp"
 bool success = remesher.optimalDelaunayTriangulation(1);
 ```
 ## TODO
