@@ -20,7 +20,6 @@
 ## Call Example
 ```
 bool success = remesher.optimalDelaunayTriangulation(1);
-
 ```
 ## TODO
 - Inserted vertices are mapped extrinsically by barycentric coordinates, needs proper geodesic tracing
