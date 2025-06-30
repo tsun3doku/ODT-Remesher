@@ -14,11 +14,12 @@
 
 - Inserts vertices at the circumcenter or splits edges as a fallback
 
-- Locally reflips
-
 ## Optimal Positioning
 - Moves inserted vertices toward their weighted circumcenters
 
+## Call Example
+``` bool success = remesher.optimalDelaunayTriangulation(1);
+```
 ## TODO
 - Inserted vertices are mapped extrinsically by barycentric coordinates, needs proper geodesic tracing
   
