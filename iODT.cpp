@@ -56,6 +56,13 @@ bool iODT::optimalDelaunayTriangulation(SignpostMesh& mesh, int maxIterations)
         }
     }
 
+    // 4) Optimal positioning of inserted vertices
+    std::cout << "\n=== Repositioning Phase ===" << std::endl;
+    repositionInsertedVertices(5, 1e-4);
+    // Update intrinsic data after repositioning
+    conn.initializeIntrinsicLengths();
+    mesh.updateAllCornerAngles();
+    mesh.updateAllSignposts();
 
     // 6) Push the result back to the model & GPU
     mesh.applyToModel(model);
