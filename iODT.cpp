@@ -1,32 +1,55 @@
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtc/constants.hpp>
 
 #include <iostream>
+#include "glm/gtx/string_cast.hpp"
+#include "glm/gtc/constants.hpp"
 #include <chrono>
 #include <algorithm>
 #include <queue>
 
-#include "SignpostMesh.hpp"
 #include "iODT.hpp"
 
-iODT::iODT(Model& model) : model(model) {
-}
+std::ostream& operator<<(std::ostream& os, const GeodesicTracer::SurfacePoint::Type& type) {
+    switch (type) {
+    case GeodesicTracer::SurfacePoint::Type::VERTEX: os << "VERTEX"; break;
+    case GeodesicTracer::SurfacePoint::Type::EDGE:   os << "EDGE";   break;
+    case GeodesicTracer::SurfacePoint::Type::FACE:   os << "FACE";   break;
+    default:                                         os << "UNKNOWN"; break;
+    }
+    return os;
+}   
 
-bool iODT::optimalDelaunayTriangulation(SignpostMesh& mesh, int maxIterations)
-{
-    // 1) Build connectivity & geometry from your model
+iODT::iODT(Model& model, SignpostMesh& mesh) : model(model), mesh(mesh), tracer(mesh) {
+    // Build the intrinsic mesh
     mesh.buildFromModel(model);
     auto& conn = mesh.getConnectivity();
     conn.rebuildConnectivity();
     conn.rebuildEdges();
-
-    std::cout << "Computing initial corner angles...\n";
-    mesh.updateAllCornerAngles();
+    conn.rebuildOpposites();
+    conn.initializeIntrinsicLengths();
+    mesh.updateAllCornerAngles({});
     mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();
+}
 
-    // 2) Make mesh Delaunay
-    std::cout << "\n=== Delaunay Flipping Phase ===" << std::endl;
+bool iODT::optimalDelaunayTriangulation(int maxIterations)
+{
+    auto& conn = mesh.getConnectivity();
+
+    //  Clear tracking 
+    insertedVertices.clear();
+    recentlySplit.clear();
+
+    // 1) Make mesh Delaunay
+
+    std::cout << "\n Delaunay Flipping Phase " << std::endl;
+
     for (int iter = 0; iter < maxIterations; ++iter) {
+#ifndef NDEBUG
         std::cout << "Delaunay pass " << (iter + 1) << "/" << maxIterations << "...\n";
+#endif
         int flips = conn.makeDelaunay(1);
         if (flips == 0) {
             std::cout << "  no more flips needed.\n";
@@ -34,18 +57,22 @@ bool iODT::optimalDelaunayTriangulation(SignpostMesh& mesh, int maxIterations)
         }
     }
 
-    // 3) Delaunay refinement to improve triangle quality
-    std::cout << "\n=== Delaunay Refinement Phase ===" << std::endl;
-    if (!delaunayRefinement(mesh)) {
+    conn.initializeIntrinsicLengths();
+    mesh.updateAllCornerAngles({});
+    mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();
+
+    
+    // 2) Delaunay refinement to improve triangle quality
+    std::cout << "\n Delaunay Refinement Phase " << std::endl;
+    if (!delaunayRefinement()) {
         std::cerr << "Warning: Delaunay refinement failed" << std::endl;
     }
 
-    // 4) Global delaunay call
-    std::cout << "\n=== Final Global Delaunay Cleanup ===" << std::endl;
-    conn.rebuildEdges();
-    conn.rebuildConnectivity();
-    conn.rebuildOpposites();
-    conn.initializeIntrinsicLengths();
+  
+    // 3) Global delaunay call
+    std::cout << "\n Final Global Delaunay" << std::endl;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
         std::cout << "Global Delaunay pass " << (iter + 1) << "/" << maxIterations << "...\n";
@@ -55,168 +82,293 @@ bool iODT::optimalDelaunayTriangulation(SignpostMesh& mesh, int maxIterations)
             break;
         }
     }
-
+    conn.rebuildEdges();
+    conn.rebuildConnectivity();
+    conn.initializeIntrinsicLengths();
+    mesh.updateAllCornerAngles({});
+    mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();  
+    
+    /*
     // 4) Optimal positioning of inserted vertices
-    std::cout << "\n=== Repositioning Phase ===" << std::endl;
-    repositionInsertedVertices(5, 1e-4);
+    //std::cout << "\n Repositioning Phase" << std::endl;
+    repositionInsertedVertices(4, 1e-4, 0.07); // Max edge length 
     // Update intrinsic data after repositioning
     conn.initializeIntrinsicLengths();
-    mesh.updateAllCornerAngles();
+    mesh.updateAllCornerAngles({});
     mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();
+    */
 
-    // 6) Push the result back to the model & GPU
+    // 5) Push the result back to the model and GPU
     mesh.applyToModel(model);
     model.recreateBuffers();
 
     return true;
 }
 
-void iODT::repositionInsertedVertices(SignpostMesh& mesh, int maxIters, double tol) {
+void iODT::repositionInsertedVertices(int maxIters, double tol, double maxEdgeLength)
+{
     auto& conn = mesh.getConnectivity();
     auto& verts = conn.getVertices();
+    auto& edges = conn.getEdges();
+    auto& halfEdges = conn.getHalfEdges();
 
-    std::cout << "Repositioning of " << insertedVertices.size() << " Inserted vertices" << std::endl;
-
+#ifndef NDEBUG
+    std::cout << "Repositioning of " << insertedVertices.size() << " inserted vertices\n";
+#endif
     if (insertedVertices.empty()) {
-        std::cout << "  No inserted vertices to reposition" << std::endl;
+#ifndef NDEBUG
+        std::cout << "  No inserted vertices to reposition\n";
+#endif
         return;
     }
 
+    const double EPS_LEN = 1e-12;
+    const double DAMPING = 0.5;          // intrinsic step damping (0..1)
+    const double START_EPS = 1e-8;       // small barycentric offset to avoid exact-vertex starts
+
     for (int iter = 0; iter < maxIters; ++iter) {
-        double maxMove = 0;
-        std::vector<glm::vec3> newPos(verts.size());
+        // Edge splitting phase
+#ifndef NDEBUG
+        std::cout << "Iteration " << (iter + 1) << " - Edge splitting phase\n";
+#endif
+        int splitCount = 0;
+        
+        // Collect edges to split (do collection first to avoid invalidating iterators)
+        std::vector<std::pair<uint32_t, uint32_t>> edgesToSplit; // pair of (edgeIdx, heIdx)
+        for (uint32_t e = 0; e < edges.size(); ++e) {
+            if (edges[e].halfEdgeIdx == INVALID_INDEX) continue;
+            
+            uint32_t he = edges[e].halfEdgeIdx;
+            double length = halfEdges[he].intrinsicLength;
+            
+            if (length > maxEdgeLength) {
+                edgesToSplit.push_back({e, he});
+            }
+        }
+        
+        // Split collected edges
+        for (const auto& [edgeIdx, heIdx] : edgesToSplit) {
+            uint32_t newVertex = INVALID_INDEX;
+            uint32_t diagFront = INVALID_INDEX;
+            uint32_t diagBack = INVALID_INDEX;
+            
+            if (splitEdge(edgeIdx, newVertex, diagFront, diagBack, heIdx, 0.5)) {
+                insertedVertices.insert(newVertex);
+                splitCount++;
+            }
+        }
+        
+#ifndef NDEBUG
+        std::cout << "  Split " << splitCount << " edges\n";
+#endif
+        
+        if (splitCount > 0) {
+            // Update mesh data after splits
+            mesh.updateAllCornerAngles({});
+            mesh.updateAllSignposts();
+            mesh.buildHalfedgeVectorsInVertex();
+            mesh.buildHalfedgeVectorsInFace();
+        }
+
+        // Vertex repositioning phase
+#ifndef NDEBUG
+        std::cout << "Iteration " << (iter + 1) << " - Vertex repositioning phase\n";
+#endif
+        double maxMove = 0.0;
         int movedCount = 0;
 
-        // Initialize all positions (only inserted vertices will be changed)
-        for (uint32_t v = 0; v < verts.size(); ++v) {
-            newPos[v] = verts[v].position;
-        }
+        // track which vertices get an update this iteration 
+        std::unordered_set<uint32_t> updatedThisIter;
 
-        // Only process inserted vertices
-        for (uint32_t v : insertedVertices) {
-            if (v >= verts.size()) continue;
+        for (uint32_t vIdx : insertedVertices) {
+            if (vIdx >= verts.size()) continue;
+            if (conn.isBoundaryVertex(vIdx)) continue;
 
-            if (conn.isBoundaryVertex(v)) {
-                continue; // Don't move boundary vertices
-            }
+            // Calculate reference face, local corner, and area weighted average vector
+            uint32_t refFace = HalfEdgeMesh::INVALID_INDEX;
+            int localRefIdx = -1;
+            glm::dvec2 avgVec(0.0);
+            double avgLen = 0.0;
+            bool ok = computeWeightedCircumcenter(vIdx, refFace, localRefIdx, avgVec, avgLen);
+            if (!ok || avgLen <= EPS_LEN) continue;
 
-            // Grab displacement vector
-            glm::vec3 vector = computeWeightedCircumcenterVector(mesh, v);
+            // compute direction in reference chart
+            glm::dvec2 dir2d = avgVec / avgLen;
 
-            // Check if we got a valid vector
-            if (!std::isfinite(vector.x) || !std::isfinite(vector.y) || !std::isfinite(vector.z)) {
-                continue;
-            }
+            // compute step: damped average length
+            double stepLen = avgLen * DAMPING;
 
-            // The vector points from current position toward optimal position
-            // Apply a damping factor for stability
-            const float DAMPING = 0.5f; // Adjust as needed
-            glm::vec3 displacement = vector * DAMPING;
+            // start bary slightly inside the reference triangle (avoid exact-vertex start)
+            glm::dvec3 startBary(START_EPS, START_EPS, START_EPS);
+            startBary[localRefIdx] = 1.0 - 2.0 * START_EPS;
 
-            // Limit movement to prevent extreme displacements
-            float displacementLength = glm::length(displacement);
-            const float MAX_DISPLACEMENT = 0.05f; // Conservative limit
+            // --- intrinsic trace: follow averaged direction for stepLen ---
+            GeodesicTracer::GeodesicTraceResult tr =
+                tracer.traceFromFace(refFace, startBary, dir2d, stepLen);
+            if (!tr.success) continue;
 
-            if (displacementLength > MAX_DISPLACEMENT) {
-                displacement = displacement * (MAX_DISPLACEMENT / displacementLength);
-            }
+            // record movement metrics
+            double moveLen = tr.distance;
+            if (moveLen > tol) ++movedCount;
+            if (moveLen > maxMove) maxMove = moveLen;
 
-            // Apply the displacement
-            newPos[v] = verts[v].position + displacement;
+            // store intrinsic exit point for final 3D evaluation
+            insertedLocation[vIdx] = tr.exitPoint;
+            updatedThisIter.insert(vIdx);
+        } // end loop over insertedVertices
 
-            double move = glm::length(displacement);
-            maxMove = std::max(maxMove, (double)move);
-            if (move > tol) movedCount++;
-        }
+        // Logging
+#ifndef NDEBUG
+        std::cout << "  Iteration " << (iter + 1)
+            << ": moved " << movedCount
+            << " vertices, max intrinsic step = " << maxMove << "\n";
+#endif
 
-        // Commit new positions
-        for (uint32_t v = 0; v < verts.size(); ++v) {
-            verts[v].position = newPos[v];
-        }
-
-        std::cout << "  Iteration " << (iter + 1) << ": moved " << movedCount
-            << " vertices, max displacement = " << maxMove << std::endl;
-
-        // Update intrinsic lengths after repositioning
-        conn.initializeIntrinsicLengths();
-
+        // Convergence test
         if (maxMove < tol) {
-            std::cout << "  Converged after " << (iter + 1) << " iterations" << std::endl;
+#ifndef NDEBUG
+            std::cout << "  Converged after " << (iter + 1) << " iterations\n";
+#endif
             break;
         }
+    } 
+
+    // Update metrics
+    mesh.updateAllCornerAngles({});
+    mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();
+
+    // Update 3d positions for inserted vertices
+    for (uint32_t vIdx : insertedVertices) {
+        auto it = insertedLocation.find(vIdx);
+        if (it == insertedLocation.end()) continue;
+        const GeodesicTracer::SurfacePoint& sp = it->second;
+        glm::dvec3 p3 = tracer.evaluateSurfacePoint(sp);
+        verts[vIdx].position = glm::vec3(p3);
     }
+#ifndef NDEBUG
+    std::cout << "Repositioning complete\n";
+#endif
 }
 
-bool iODT::delaunayRefinement(SignpostMesh& mesh) {
-    const float MIN_ANGLE = 1.0f * glm::pi<float>() / 180.0f;
-    const float MAX_AREA = 0.0025f;
+bool iODT::delaunayRefinement() {
+    const float MIN_ANGLE = 0.0f * glm::pi<float>() / 180.0f;
+    const float MAX_AREA = 0.001f;
     const float MIN_AREA = 1e-4f;
+
     auto& conn = mesh.getConnectivity();
 
+    std::unordered_set<uint32_t> processedFaces;
+
     for (int iter = 0; iter < 100; ++iter) {
+#ifndef NDEBUG
         std::cout << "Refinement iteration " << (iter + 1) << "\n";
+#endif
 
-        mesh.updateAllCornerAngles();
-        auto cands = findRefinementCandidates(mesh, MIN_ANGLE, MAX_AREA);
-
+        mesh.updateAllCornerAngles({});
+        auto cands = findRefinementCandidates(MIN_ANGLE, MAX_AREA);
         if (cands.empty()) {
+#ifndef NDEBUG
             std::cout << "Done.\n";
+#endif
             return true;
         }
 
         std::sort(cands.begin(), cands.end(),
-            [&](auto const& a, auto const& b) {
-                return a.priority > b.priority;
+            [&](auto const& a, auto const& b) { 
+                return a.priority > b.priority; 
             });
 
         bool did = false;
-        std::vector<uint32_t> newVertices;
-        std::unordered_set<uint32_t> processedEdges; // Track processed edges
-        std::unordered_set<uint32_t> processedFaces; // Track processed faces
+
+        // Skip only for this iteration
+        std::unordered_set<uint32_t> skipFaces; 
+
+        // snapshot of global insertedVertices to detect new inserts added this iteration
+        std::unordered_set<uint32_t> prevInserted = insertedVertices;
+        // Set of inserts in this iteration
+        std::unordered_set<uint32_t> iterNewVerts; 
+
+        auto markNeighborsOf = [&](uint32_t v) {
+            if (v >= conn.getVertices().size()) return;
+            auto& H = conn.getHalfEdges();
+            for (auto he : conn.getVertexHalfEdges(v)) {
+                if (he == HalfEdgeMesh::INVALID_INDEX) 
+                    continue;
+                uint32_t fidx = H[he].face;
+                if (fidx != HalfEdgeMesh::INVALID_INDEX) {
+                    // skip for the rest of this iteration
+                    skipFaces.insert(fidx); 
+                }
+            }
+            };
 
         for (auto const& C : cands) {
-            // Skip if face was already processed (invalidated)
-            if (processedFaces.count(C.faceIdx)) continue;
 
-            if (mesh.computeFaceArea(C.faceIdx) < MIN_AREA) continue;
+            // Mid iteration skipping
+            if (processedFaces.count(C.faceIdx)) 
+                continue;
+            if (skipFaces.count(C.faceIdx))      
+                continue;
 
+            // revalidate
+            float  areaNow = mesh.computeFaceArea(C.faceIdx);
+            double minAngNow = computeMinAngle(C.faceIdx);
+            if (areaNow < MIN_AREA) 
+                continue;
+
+            bool angleBadNow = (MIN_ANGLE > 0.f) ? (minAngNow < MIN_ANGLE) : false;
+            bool areaBadNow = (MAX_AREA > 0.f) ? (areaNow > MAX_AREA) : false;
+            if (!(angleBadNow || areaBadNow)) {
+                // Not a candidate
+                continue; 
+            }
+
+            // Refine
             uint32_t newV = UINT32_MAX;
-            bool success = false;
+            bool success = insertCircumcenter(C.faceIdx, newV);
+            if (!success) 
+                continue;
 
-            if (C.type == RefinementType::CIRCUMCENTER_INSERTION) {
-                success = insertCircumcenter(mesh, C.faceIdx, newV);
-                if (success) {
-                    processedFaces.insert(C.faceIdx);
+            did = true;
+            processedFaces.insert(C.faceIdx);
+
+            // collect vertices actually created by this call
+            std::vector<uint32_t> createdNow;
+            if (newV != UINT32_MAX && newV < conn.getVertices().size()) {
+                if (!iterNewVerts.count(newV)) {
+                    createdNow.push_back(newV);
+                    iterNewVerts.insert(newV);
                 }
             }
             else {
-                // Skip if edge was already processed
-                if (processedEdges.count(C.edgeIdx)) continue;
-
-                std::cout << "[REFINE] splitting edge " << C.edgeIdx << "\n";
-                success = splitEdge(mesh, C.edgeIdx, newV);
-                if (success) {
-                    processedEdges.insert(C.edgeIdx);
-                    // Mark faces that used this edge as processed
-                    // (they will be invalidated by the split)
-                    auto& edges = conn.getEdges();
-                    if (C.edgeIdx < edges.size()) {
-                        uint32_t he = edges[C.edgeIdx].halfEdgeIdx;
-                        if (he != HalfEdgeMesh::INVALID_INDEX) {
-                            processedFaces.insert(conn.getHalfEdges()[he].face);
-                            uint32_t oppHe = conn.getHalfEdges()[he].opposite;
-                            if (oppHe != HalfEdgeMesh::INVALID_INDEX) {
-                                processedFaces.insert(conn.getHalfEdges()[oppHe].face);
-                            }
-                        }
+                // detect new ones via global set diff
+                for (uint32_t v : insertedVertices) {
+                    if (!prevInserted.count(v) && !iterNewVerts.count(v)) {
+                        createdNow.push_back(v);
+                        iterNewVerts.insert(v);
                     }
                 }
             }
 
-            if (success) {
-                did = true;
-                newVertices.push_back(newV);
+            // skip neighbors of newly created verts for the rest of THIS iteration
+            for (uint32_t v : createdNow) {
+                markNeighborsOf(v);
             }
+
+            // keep state consistent before next candidate
+#ifndef NDEBUG
+            std::cout << "Updating corner angles and signposts after flips...\n";
+#endif
+            mesh.updateAllCornerAngles({});
+            mesh.updateAllSignposts();
+            mesh.buildHalfedgeVectorsInVertex();
+            mesh.buildHalfedgeVectorsInFace();
         }
 
         if (!did) {
@@ -224,418 +376,882 @@ bool iODT::delaunayRefinement(SignpostMesh& mesh) {
             return true;
         }
 
-        // Rebuild after split
-        conn.rebuildEdges();
-        conn.rebuildConnectivity();
-        conn.initializeIntrinsicLengths();
-
-        // 5) local Delaunay flips around every new vertex
-        std::queue<uint32_t> Q;
-        for (uint32_t v : newVertices) {
-            for (auto he : conn.getVertexHalfEdges(v)) {
-                if (he != HalfEdgeMesh::INVALID_INDEX)
-                    Q.push(he);
-            }
-        }
-        while (!Q.empty()) {
-            uint32_t he = Q.front(); Q.pop();
-            if (!conn.isDelaunayEdge(he) && conn.flipEdge(he)) {
-                auto& H = conn.getHalfEdges();
-                Q.push(H[he].next);
-                Q.push(H[H[he].opposite].next);
-            }
-        }
-
-        // 6) Update corner angles after all flipping is done
-        std::cout << "Updating corner angles and signposts after flips...\n";
-        mesh.updateAllCornerAngles();
-        mesh.updateAllSignposts();
-
-        std::cout << "Processed " << newVertices.size()
-            << " refinements this iteration.\n";
-        std::cout << "Local flipping completed.\n";
+        // next iteration: full rescan; skipFaces is cleared by scope
     }
 
     std::cout << "Reached max iterations\n";
     return true;
 }
 
-bool iODT::insertCircumcenter(SignpostMesh& mesh, uint32_t faceIdx, uint32_t& outNewVertex) {
-    auto& conn = mesh.getConnectivity();
-    const auto& faces = conn.getFaces();
-
-    std::cout << "[insertCircumcenter] called on faceIdx = " << faceIdx << std::endl;
-
-    // 1) Validate face index
-    if (faceIdx >= faces.size()) {
-        std::cout << "  -> faceIdx out of range. Returning false.\n";
-        return false;
-    }
-    if (faces[faceIdx].halfEdgeIdx == HalfEdgeMesh::INVALID_INDEX) {
-        std::cout << "  -> face " << faceIdx << " already invalidated. Returning false.\n";
-        return false;
-    }
-
-    // 2) Reject near zero area
-    float area = mesh.computeFaceArea(faceIdx);
-    std::cout << "  -> face area = " << area << std::endl;
-    if (area < 1e-8f) {
-        std::cout << "  -> area < 1e-8, skipping insertion.\n";
-        return false;
-    }
-
-    // 3) Get intrinsic edge lengths
-    std::vector<uint32_t> faceHEs = conn.getFaceHalfEdges(faceIdx);
-    if (faceHEs.size() != 3) {
-        std::cout << "  -> not a triangle, skipping.\n";
-        return false;
-    }
-
-    const auto& HEs = conn.getHalfEdges();
-    // 1) Compute the three corner vertex indices:
-    uint32_t he0 = faceHEs[0];
-    uint32_t he1 = faceHEs[1];
-    uint32_t he2 = faceHEs[2];
-
-    // v0 is the origin of he0
-    uint32_t v0 = HEs[he0].origin;
-    // v1 is the origin of he1
-    uint32_t v1 = HEs[he1].origin;
-    // v2 is the origin of he2
-    uint32_t v2 = HEs[he2].origin;
-
-    // 2) The 3 intrinsic lengths (a,b,c) already come from exactly those halfedges:
-    double a = HEs[he0].intrinsicLength; // length(v0->v1)
-    double b = HEs[he1].intrinsicLength; // length(v1->v2)
-    double c = HEs[he2].intrinsicLength; // length(v2->v0)
-
-    std::cout << "  -> intrinsic edge lengths: a=" << a << ", b=" << b << ", c=" << c << std::endl;
-
-    // 4) Layout triangle in 2D
-    glm::dvec2 P0(0.0, 0.0);
-    glm::dvec2 P1(a, 0.0);
-
-    // Compute P2 using law of cosines
-    double x = (a * a + c * c - b * b) / (2.0 * a);
-    double y2 = c * c - x * x;
-    if (y2 < 0) {
-        std::cout << "  -> degenerate triangle in 2D layout, skipping\n";
-        return false;
-    }
-    glm::dvec2 P2(x, std::sqrt(y2));
-
-    std::cout << "  -> 2D layout: P0=(" << P0.x << "," << P0.y
-        << "), P1=(" << P1.x << "," << P1.y
-        << "), P2=(" << P2.x << "," << P2.y << ")" << std::endl;
-
-    std::cout << "  -> 2D layout:\n"
-        << "       P0 (vertex " << v0 << ") = (" << P0.x << "," << P0.y << ")\n"
-        << "       P1 (vertex " << v1 << ") = (" << P1.x << "," << P1.y << ")\n"
-        << "       P2 (vertex " << v2 << ") = (" << P2.x << "," << P2.y << ")\n";
-
-    // 5) Compute 2D circumcenter
-    glm::dvec2 cc2d = mesh.computeCircumcenter2D(P0, P1, P2);
-    if (!std::isfinite(cc2d.x) || !std::isfinite(cc2d.y)) {
-        std::cout << "  -> 2D circumcenter is NaN/infinite, skipping\n";
-        return false;
-    }
-
-    std::cout << "  -> 2D circumcenter: (" << cc2d.x << "," << cc2d.y << ")" << std::endl;
-
-    // 5) Use your existing barycentric function
-    glm::dvec3 bary = mesh.computeBarycentric2D(cc2d, P0, P1, P2);
-    double lambda0 = bary.x;  // Weight for vertex 0 (P0)
-    double lambda1 = bary.y;  // Weight for vertex 1 (P1)
-    double lambda2 = bary.z;  // Weight for vertex 2 (P2)
-
-    std::cout << "  -> barycentric coords: lambda0=" << lambda0 << ", lambda1=" << lambda1 << ", lambda2=" << lambda2 << std::endl;
-
-    double sum = bary.x + bary.y + bary.z;
-    std::cout << "  -> bary sum = " << sum << std::endl;
-
-    const double BARY_TOLERANCE = 1e-2;
-
-    // Check if circumcenter is too close to any edge
-    if (lambda0 < BARY_TOLERANCE) {
-        std::cout << "  -> circumcenter too close to edge opposite vertex 0 (edge v1-v2), splitting edge instead\n";
-        uint32_t edgeIdx = conn.getEdgeIndexFromHalfEdge(he1);
-        if (edgeIdx != HalfEdgeMesh::INVALID_INDEX) {
-            return splitEdge(mesh, edgeIdx, outNewVertex);
-        }
-        return false;
-    }
-
-    if (lambda1 < BARY_TOLERANCE) {
-        std::cout << "  -> circumcenter too close to edge opposite vertex 1 (edge v2-v0), splitting edge instead\n";
-        uint32_t edgeIdx = conn.getEdgeIndexFromHalfEdge(he2);
-        if (edgeIdx != HalfEdgeMesh::INVALID_INDEX) {
-            return splitEdge(mesh, edgeIdx, outNewVertex);
-        }
-        return false;
-    }
-
-    if (lambda2 < BARY_TOLERANCE) {
-        std::cout << "  -> circumcenter too close to edge opposite vertex 2 (edge v0-v1), splitting edge instead\n";
-        uint32_t edgeIdx = conn.getEdgeIndexFromHalfEdge(he0);
-        if (edgeIdx != HalfEdgeMesh::INVALID_INDEX) {
-            return splitEdge(mesh, edgeIdx, outNewVertex);
-        }
-        return false;
-    }
-
-    // 6) Compute new intrinsic edge lengths in 2D
-    double r0 = glm::length(cc2d - P0);
-    double r1 = glm::length(cc2d - P1);
-    double r2 = glm::length(cc2d - P2);
-
-    std::cout << "  -> new intrinsic lengths: r0=" << r0 << ", r1=" << r1 << ", r2=" << r2 << std::endl;
-
-    // 7) Validate triangle inequalities BEFORE splitting
-    const double EPS = 1e-12;
-
-    // Triangle (v0, v1, newV): edges a, r0, r1
-    if (!(a + r0 > r1 + EPS && a + r1 > r0 + EPS && r0 + r1 > a - EPS)) {
-        std::cout << "  -> triangle inequality violation for triangle 1, skipping\n";
-        return false;
-    }
-
-    // Triangle (v1, v2, newV): edges b, r1, r2
-    if (!(b + r1 > r2 + EPS && b + r2 > r1 + EPS && r1 + r2 > b - EPS)) {
-        std::cout << "  -> triangle inequality violation for triangle 2, skipping\n";
-        return false;
-    }
-
-    // Triangle (v2, v0, newV): edges c, r2, r0
-    if (!(c + r2 > r0 + EPS && c + r0 > r2 + EPS && r2 + r0 > c - EPS)) {
-        std::cout << "  -> triangle inequality violation for triangle 3, skipping\n";
-        return false;
-    }
-
-    std::cout << "  -> all triangle inequalities satisfied, proceeding with split\n";
-
-    // 8) Perform intrinsic split
-    uint32_t newV = conn.splitTriangleIntrinsic(faceIdx, r0, r1, r2);
-    if (newV == HalfEdgeMesh::INVALID_INDEX) {
-        std::cout << "  -> splitTriangleIntrinsic failed.\n";
-        return false;
-    }
-
-    // Track this as an inserted vertex
-    insertedVertices.insert(newV);
-    std::cout << "  -> splitTriangleIntrinsic succeeded.\n";
-
-    // 10) Set the 3D position of the new vertex
-    glm::vec3 v0Pos = conn.getVertices()[v0].position;
-    glm::vec3 v1Pos = conn.getVertices()[v1].position;
-    glm::vec3 v2Pos = conn.getVertices()[v2].position;
-
-    // Barycentric interpolation in 3D:
-    glm::dvec3 newPos3D_d =
-        lambda0 * glm::dvec3(v0Pos) +
-        lambda1 * glm::dvec3(v1Pos) +
-        lambda2 * glm::dvec3(v2Pos);
-
-    // Set it
-    conn.getVertices()[newV].position = glm::vec3(newPos3D_d);
-
-    // 11) Rebuild connectivity structures
-    conn.rebuildEdges();
-    conn.rebuildConnectivity();
-
-    outNewVertex = newV;
-    std::cout << "Successfully inserted circumcenter at face " << faceIdx << std::endl;
-    return true;
-}
-
-std::vector<iODT::RefinementCandidate>iODT::findRefinementCandidates(const SignpostMesh& mesh, float minAngleThreshold, float maxAreaThreshold) {
-    constexpr float MIN_AREA = 1e-5f;
-    constexpr float MIN_EDGE_LEN = 1e-3f;
+std::vector<iODT::RefinementCandidate>iODT::findRefinementCandidates(float minAngleThreshold, float maxAreaThreshold) {
+    constexpr float MIN_AREA = 1e-4f;
 
     auto& conn = mesh.getConnectivity();
     auto const& F = conn.getFaces();
     std::vector<RefinementCandidate> out;
     out.reserve(F.size());
 
-    std::cout
-        << "  [DEBUG] minAngleThreshold (rad) = "
-        << minAngleThreshold
-        << " (" << (minAngleThreshold * 180.0f / glm::pi<float>())
-        << " deg), maxAreaThreshold = " << maxAreaThreshold
-        << "\n";
+#ifndef NDEBUG
+    std::cout << "  [DEBUG] minAngleThreshold (rad) = "
+        << minAngleThreshold << " ("
+        << (minAngleThreshold * 180.0f / glm::pi<float>())
+        << " deg), maxAreaThreshold = " << maxAreaThreshold << "\n";
+#endif
 
-    // Helper: lay out triangle in 2D, compute circumcenter, test barycentric coords
-    auto tryCC = [&](uint32_t fIdx, glm::dvec2& cc) -> std::pair<bool, uint32_t> {
-        uint32_t startHE = F[fIdx].halfEdgeIdx;
-        uint32_t he[3] = {
-            startHE,
-            conn.getHalfEdges()[startHE].next,
-            conn.getHalfEdges()[conn.getHalfEdges()[startHE].next].next
-        };
-        double L0 = conn.getHalfEdges()[he[0]].intrinsicLength;
-        double L1 = conn.getHalfEdges()[he[1]].intrinsicLength;
-        double L2 = conn.getHalfEdges()[he[2]].intrinsicLength;
+    int totalFaces = 0, skippedMinArea = 0, skippedZeroAngle = 0, skippedNotBad = 0, addedCandidates = 0;
 
-        // 2D layout
-        glm::dvec2 P0(0.0, 0.0), P1(L0, 0.0);
-        double a = L0, b = L1, c = L2;
-        double x = (a * a + c * c - b * b) / (2.0 * a);
-        double y2 = c * c - x * x;
-        double y = (y2 < 0 ? 0 : std::sqrt(y2));
-        glm::dvec2 P2(x, y);
-
-        // Calculate circumcenter
-        double D = 2.0 * (P1.x * P2.y - P2.x * P1.y);
-        if (std::fabs(D) < 1e-12) D = std::copysign(1e-12, D);
-        cc = {
-          (P2.y * (P1.x * P1.x + P1.y * P1.y)
-          - P1.y * (P2.x * P2.x + P2.y * P2.y)) / D,
-          (-P2.x * (P1.x * P1.x + P1.y * P1.y)
-          + P1.x * (P2.x * P2.x + P2.y * P2.y)) / D
-        };
-
-        // Barycentric calculation
-        double denom = (P1.y - P2.y) * (P0.x - P2.x) + (P2.x - P1.x) * (P0.y - P2.y);
-        if (std::fabs(denom) < 1e-12)
-            return { false, he[0] };  // degenerate
-
-        double lambda0 = ((P1.y - P2.y) * (cc.x - P2.x) + (P2.x - P1.x) * (cc.y - P2.y)) / denom;
-        double lambda1 = ((P2.y - P0.y) * (cc.x - P2.x) + (P0.x - P2.x) * (cc.y - P2.y)) / denom;
-        double lambda2 = 1.0 - lambda0 - lambda1;
-
-        const double eps = 1e-8;
-        if (lambda0 < eps) return { false, he[1] }; // too close to edge v1-v2
-        if (lambda1 < eps) return { false, he[2] }; // too close to edge v2-v0
-        if (lambda2 < eps) return { false, he[0] }; // too close to edge v0-v1
-
-        return { true, 0u };
-        };
-
-    // Scan all faces
     for (uint32_t f = 0; f < F.size(); ++f) {
-        uint32_t startHE = F[f].halfEdgeIdx;
-        if (startHE == HalfEdgeMesh::INVALID_INDEX) {
-            std::cout << "  [DEBUG] face=" << f << " invalid, skip\n";
+        ++totalFaces;
+        if (F[f].halfEdgeIdx == HalfEdgeMesh::INVALID_INDEX) continue;
+
+        float  area = mesh.computeFaceArea(f);
+        double minAng = computeMinAngle(f);
+
+        if (area < MIN_AREA) { ++skippedMinArea;  continue; }
+        if (minAng <= 0.0) { ++skippedZeroAngle; continue; }
+
+        bool angleBad = (minAngleThreshold > 0.f) ? (minAng < minAngleThreshold) : false;
+        bool areaBad = (maxAreaThreshold > 0.f) ? (area > maxAreaThreshold) : false;
+
+        if (!(angleBad || areaBad)) {
+#ifndef NDEBUG
+            std::cout << "[DEBUG] skip face " << f
+                << " minAng=" << minAng << " thresh=" << minAngleThreshold
+                << " area=" << area << " maxArea=" << maxAreaThreshold
+                << " angleBad=" << angleBad << " areaBad=" << areaBad << "\n";
+#endif
+            
+            ++skippedNotBad;
             continue;
         }
 
-        float area = mesh.computeFaceArea(f);
-        float minAng = computeMinAngle(mesh, f);
-
-        std::cout
-            << "  [DEBUG] face=" << f
-            << "  area=" << area
-            << "  minAng=" << minAng
-            << " (" << (minAng * 180.0f / glm::pi<float>()) << " deg)\n";
-
-        if (area < MIN_AREA) {
-            std::cout << "    -> area<MIN_AREA skip\n";
-            continue;
-        }
-        if (minAng <= 0.0f) {
-            std::cout << "    -> minAng<=0 skip\n";
-            continue;
-        }
-
-        bool angleBad = (minAng < minAngleThreshold);
-        bool areaBad = (area > maxAreaThreshold);
-        if (!angleBad && !areaBad) {
-            std::cout << "    -> neither bad, skip\n";
-            continue;
-        }
-
-        std::cout << "    -> candidate ("
-            << (angleBad ? "bad angle" : "")
-            << (angleBad && areaBad ? " + " : "")
-            << (areaBad ? "bad area" : "")
-            << ")\n";
-
-        glm::dvec2 cc;
-        auto [ok, badHE] = tryCC(f, cc);
-
-        RefinementCandidate rc;
+        RefinementCandidate rc{};
         rc.faceIdx = f;
         rc.minAngle = minAng;
         rc.area = area;
-        rc.priority = ok
-            ? (minAngleThreshold - minAng) / minAngleThreshold + area / maxAreaThreshold
-            : 1.0f + area / maxAreaThreshold;
+        rc.type = RefinementType::CIRCUMCENTER_INSERTION;
+        rc.edgeIdx = HalfEdgeMesh::INVALID_INDEX;
 
-        if (ok) {
-            rc.type = RefinementType::CIRCUMCENTER_INSERTION;
-            rc.edgeIdx = HalfEdgeMesh::INVALID_INDEX;
-        }
-        else {
-            uint32_t e = conn.getEdgeIndexFromHalfEdge(badHE);
-            double L = conn.getIntrinsicLengthFromHalfEdge(e);
-            if (e == HalfEdgeMesh::INVALID_INDEX) {
-                std::cout << "      -> badHE->edgeIdx invalid, skip\n";
-                continue;
-            }
-            if (L < 2 * MIN_EDGE_LEN) {
-                std::cout << "      -> L=" << L << "<2*MIN_EDGE_LEN, skip\n";
-                continue;
-            }
-            if (recentlySplit.count(std::minmax(
-                conn.getHalfEdges()[conn.getEdges()[e].halfEdgeIdx].origin,
-                conn.getHalfEdges()[conn.getEdges()[e].halfEdgeIdx].next
-            )))
-            {
-                std::cout << "      -> edge blocked, skip\n";
-                continue;
-            }
-            rc.type = RefinementType::EDGE_SPLIT;
-            rc.edgeIdx = e;
-        }
-
-        std::cout << "    -> ADDED face=" << f
-            << " type=" << (rc.type == RefinementType::CIRCUMCENTER_INSERTION ? "CC" : "SPLIT")
-            << (rc.type == RefinementType::EDGE_SPLIT ? (" edge=" + std::to_string(rc.edgeIdx)) : "")
-            << "\n";
+        // safe priority
+        float scoreArea = (maxAreaThreshold > 0.f) ? (area / maxAreaThreshold) : 0.f;
+        float scoreAngle = (minAngleThreshold > 0.f) ? ((minAngleThreshold - float(minAng)) / minAngleThreshold) : 0.f;
+        rc.priority = scoreArea + scoreAngle;
 
         out.push_back(rc);
+        ++addedCandidates;
     }
+
+#ifndef NDEBUG
+    std::cout << "  [DEBUG] Face filtering: total=" << totalFaces
+        << " skippedMinArea=" << skippedMinArea
+        << " skippedZeroAngle=" << skippedZeroAngle
+        << " skippedNotBad=" << skippedNotBad
+        << " candidates=" << addedCandidates << std::endl;
+#endif
 
     return out;
 }
 
-bool iODT::splitEdge(SignpostMesh& mesh, uint32_t edgeIdx, uint32_t& outNewVertex) {
+bool iODT::insertCircumcenter(uint32_t faceIdx, uint32_t& outNewVertex) {
     auto& conn = mesh.getConnectivity();
-    constexpr uint32_t INV = HalfEdgeMesh::INVALID_INDEX;
+    auto& halfEdges = conn.getHalfEdges();
+    const auto& faces = conn.getFaces();
 
-    // Get original endpoints for 3D position interpolation
-    uint32_t parentHE = conn.getEdges()[edgeIdx].halfEdgeIdx;
-    uint32_t oppHE = conn.getHalfEdges()[parentHE].opposite;
-    uint32_t VA = conn.getHalfEdges()[parentHE].origin;
-    uint32_t VB = conn.getHalfEdges()[oppHE].origin;
+#ifndef NDEBUG
+    std::cout << "[insertCircumcenter] called on faceIdx = " << faceIdx << std::endl;
+#endif
 
-    // Call splitEdgeTopo
-    auto R = conn.splitEdgeTopo(edgeIdx, 0.5);
-    if (R.newV == INV) {
-        std::cout << "[splitEdge] splitEdgeTopo failed\n";
+    // 1) Validate face index
+    if (faceIdx >= faces.size()) {
+#ifndef NDEBUG
+        std::cout << "  -> faceIdx out of range. Returning false.\n";
+#endif
+        return false;
+    }
+    if (faces[faceIdx].halfEdgeIdx == INVALID_INDEX) {
+#ifndef NDEBUG
+        std::cout << "  -> face " << faceIdx << " already invalidated. Returning false.\n";
+#endif
         return false;
     }
 
-    // Track this as an inserted vertex
-    insertedVertices.insert(R.newV);
+    // 2) Reject tiny faces
+    float area = mesh.computeFaceArea(faceIdx);
+#ifndef NDEBUG
+    std::cout << "  -> face area = " << area << std::endl;
+#endif
+    if (area < 1e-8f) {
+#ifndef NDEBUG
+        std::cout << "  -> area < 1e-8, skipping insertion.\n";
+#endif
+        return false;
+    }
 
-    // Set the 3D position of the new vertex
-    auto& V = conn.getVertices();
-    V[R.newV].position = glm::mix(V[VA].position, V[VB].position, 0.5f);
+    // 3) Layout original triangle in 2d
+    auto triangle2D = mesh.layoutTriangle(faceIdx);
+    glm::dvec2 P0 = triangle2D.vertices[0], P1 = triangle2D.vertices[1], P2 = triangle2D.vertices[2];
 
-    outNewVertex = R.newV;
+    // 4) Calculate 2d circumcenter 
+    glm::dvec2 cc2d = mesh.computeCircumcenter2D(P0, P1, P2);
+    if (!std::isfinite(cc2d.x) || !std::isfinite(cc2d.y))
+        return false;
+
+#ifndef NDEBUG
+    std::cout << "[insertCircumcenter] circumcenter 2D coords=(" << cc2d.x << "," << cc2d.y << ")" << std::endl;
+#endif
+
+    // 5) Pick corner furthest the circumcenter (smallest barycentric)
+    glm::dvec3 circumcenterBary = mesh.computeBarycentric2D(cc2d, P0, P1, P2);
+    int corner = 0;
+
+#ifndef NDEBUG
+    std::cout << "[insertCircumcenter] circumcenter bary coords=(" << circumcenterBary.x << "," << circumcenterBary.y << "," << circumcenterBary.z << ")" << std::endl;
+#endif
+
+    if (circumcenterBary.y < circumcenterBary.x)
+        corner = 1;
+    if (circumcenterBary.z < circumcenterBary[corner])
+        corner = 2;
+    
+    constexpr double EPS = 1e-4;
+    glm::dvec3 cornerB(EPS);
+    cornerB[corner] = 1.0 - 2.0 * EPS;
+
+    // Calculate the 2d start point inside the triangle
+    glm::dvec2 start2D =
+        P0 * cornerB.x +
+        P1 * cornerB.y +
+        P2 * cornerB.z;
+
+    // 6) Build intrinsic vector ray
+    glm::dvec2 dir2D = cc2d - start2D;
+    double length = glm::length(dir2D);
+
+    if (length < 1e-12)
+        return false;
+
+    dir2D /= length;
+
+    // 7) Trace across face/faces
+    GeodesicTracer::GeodesicTraceResult intrinsicRes = tracer.traceFromFace(
+        faceIdx,     // start face
+        cornerB,     // start corner bary
+        dir2D,       // 2D direction in chart
+        length       // circumradius
+    );
+
+    if (!intrinsicRes.success) {
+#ifndef NDEBUG
+        std::cout << "Intrinsic trace failed" << std::endl;
+#endif
+        return false;
+    }
+
+    // 8) Pick insertion type
+    GeodesicTracer::SurfacePoint& surfacePoint = intrinsicRes.exitPoint;
+ 
+#ifndef NDEBUG
+    std::cout << "[insertCircumcenter] Intrinsic surface point of CC is type:" << surfacePoint.type
+        << " with bary:(" << surfacePoint.baryCoords.x << "," << surfacePoint.baryCoords.y 
+        << "," << surfacePoint.baryCoords.z << ")" << std::endl;
+#endif
+
+    if (surfacePoint.type == GeodesicTracer::SurfacePoint::Type::VERTEX) {
+#ifndef NDEBUG
+        std::cout << "[insertCircumcenter] trace hit existing vertex "
+            << surfacePoint.elementId << ", skipping insertion\n";
+#endif
+         
+        return false; 
+    }
+
+    // Record point location
+    GeodesicTracer::SurfacePoint pendingInsert = surfacePoint;
+
+    if (surfacePoint.type == GeodesicTracer::SurfacePoint::Type::EDGE) {
+        // EDGE split
+        uint32_t edgeIdx = surfacePoint.elementId;
+        double split = surfacePoint.split;
+        
+        // Pick a halfedge on the edge to pass to splitEdge
+        uint32_t heSplit = conn.getEdges()[edgeIdx].halfEdgeIdx;
+        if (heSplit == HalfEdgeMesh::INVALID_INDEX) {
+#ifndef NDEBUG
+            std::cout << "[insertCircumcenter] invalid halfedge for edge " << edgeIdx << std::endl;
+#endif
+            return false;
+        }
+
+#ifndef NDEBUG
+        std::cout << "[insertCircumcenter] splitting edge " << edgeIdx << " at t=" << split << " using halfedge " << heSplit << std::endl;
+#endif
+        
+        splitEdge(edgeIdx, outNewVertex, outNewVertex, outNewVertex, heSplit, split);
+        insertedLocation[outNewVertex] = pendingInsert;
+
+        mesh.updateAllCornerAngles({});
+        mesh.updateAllSignposts();
+        mesh.buildHalfedgeVectorsInVertex();
+        mesh.buildHalfedgeVectorsInFace();
+        return true;
+
+    } else {
+        // FACE insert (circumcenter in start face)
+        uint32_t targetFace = surfacePoint.elementId;
+        glm::dvec3 targetBary = surfacePoint.baryCoords;
+
+        // 9) Layout target face and calculate split radii
+        auto triangleTarget = mesh.layoutTriangle(targetFace);
+        glm::dvec2 V0 = triangleTarget.vertices[0], V1 = triangleTarget.vertices[1], V2 = triangleTarget.vertices[2];
+        glm::dvec2 s2D = V0 * targetBary.x + V1 * targetBary.y + V2 * targetBary.z;
+        double R0 = glm::length(s2D - V0);
+        double R1 = glm::length(s2D - V1);
+        double R2 = glm::length(s2D - V2);
+
+        // 11) Trace target face to find the 3D position
+        //    startHe = the halfedge of the original faceIdx at the chosen corner
+        auto startHEs = conn.getFaceHalfEdges(faceIdx);
+        uint32_t startHe = startHEs[corner];
+
+#ifndef NDEBUG
+        std::cout << "[insertCircumcenter] using startHe=" << startHe
+            << " (origin vertex=" << halfEdges[startHe].origin << ")\n";
+        std::cout << "[insertCircumcenter] calling resolveVertex..." << std::endl;
+#endif
+        glm::dvec3 resolvedPos;
+        if (!tracer.resolveVertex(faceIdx, startHe, intrinsicRes, resolvedPos)) {
+#ifndef NDEBUG
+            std::cout << "[insertCircumcenter] resolveVertex failed\n";
+#endif
+            return false;
+        }
+
+        // 10) Intrinsic split
+        uint32_t newV = conn.splitTriangleIntrinsic(targetFace, R0, R1, R2);
+        insertedLocation[newV] = pendingInsert;
+        if (newV == HalfEdgeMesh::INVALID_INDEX)
+            return false;
+
+        mesh.updateAllCornerAngles({});
+        mesh.updateAllSignposts();
+        mesh.buildHalfedgeVectorsInVertex();
+        mesh.buildHalfedgeVectorsInFace();
+
+        // 13) Mark only new edges as not original
+        for (uint32_t he : conn.getVertexHalfEdges(newV)) {
+            uint32_t e = conn.getEdgeIndexFromHalfEdge(he);
+            if (e < conn.getEdges().size()) {
+                conn.getEdges()[e].isOriginal = false;
+            }
+        }
+        conn.getVertices()[newV].position = resolvedPos;
+        insertedVertices.insert(newV);
+        outNewVertex = newV;
+
+#ifndef NDEBUG
+        std::cout << "[insertCircumcenter]  final 3D pos of newv=" << outNewVertex
+            << " is " << conn.getVertices()[outNewVertex].position.x << ","
+            << conn.getVertices()[outNewVertex].position.y << ","
+            << conn.getVertices()[outNewVertex].position.z << "\n";
+
+        if (targetFace != HalfEdgeMesh::INVALID_INDEX) {
+            std::cout << "[insertCircumcenter] Successfully inserted vertex on face="
+                << targetFace << std::endl;
+        }
+        else {
+            std::cout << "[insertCircumcenter] Failed to insert vertex newV=" << outNewVertex
+                << " on face=" << targetFace << "\n";
+        }
+#endif
+
+        return true;
+    }
+}
+
+bool iODT::splitEdge(uint32_t edgeIdx, uint32_t& outNewVertex, uint32_t& outDiagFront, uint32_t& outDiagBack, uint32_t HESplit, double t) {
+    auto& conn = mesh.getConnectivity();
+    auto& edges = conn.getEdges();
+    auto& halfEdges = conn.getHalfEdges();
+    auto& faces = conn.getFaces();
+
+    if (edgeIdx >= edges.size()) {
+#ifndef NDEBUG
+        std::cout << "[splitEdge] Invalid edge index\n";
+#endif
+        return false;
+    }
+
+    // 1) Use the provided halfedge directly
+    uint32_t parentHE = HESplit;
+    uint32_t oppHE = halfEdges[parentHE].opposite;
+
+    // Verify the halfedge actually belongs to this edge
+    uint32_t edgeFromHE = conn.getEdgeIndexFromHalfEdge(HESplit);
+    if (edgeFromHE != edgeIdx) {
+#ifndef NDEBUG
+        std::cout << "[splitEdge] Provided halfedge " << HESplit
+            << " doesn't belong to edge " << edgeIdx << ", aborting\n";
+#endif
+        return false;
+    }
+
+    uint32_t originalVA = halfEdges[parentHE].origin;
+    uint32_t originalVB = halfEdges[halfEdges[parentHE].next].origin;
+
+#ifndef NDEBUG
+    std::cout << "[splitEdge] Splitting edge " << edgeIdx
+        << " between vertices " << originalVA << " -> " << originalVB
+        << " using halfedge " << HESplit << std::endl;
+#endif
+
+    // 2) Set split fraction
+    double splitFraction = t;
+#ifndef NDEBUG
+    std::cout << "[splitEdge] Using provided split fraction: " << splitFraction << "\n";
+#endif
+
+    // 3) Get original halfedge length and compute child lengths
+    double originalLength = halfEdges[parentHE].intrinsicLength;
+
+    if (originalLength <= 1e-12) {
+#ifndef NDEBUG
+        std::cout << "[splitEdge] Halfedge had " << originalLength << " intrinsic length, skipping\n";
+#endif
+        return false;
+    }
+
+    double La = splitFraction * originalLength;
+    double Lb = (1.0 - splitFraction) * originalLength;
+
+#ifndef NDEBUG
+    std::cout << "[splitEdge] originalLength=" << originalLength
+        << " -> La=" << La << ", Lb=" << Lb << std::endl;
+#endif
+
+    // 4) Precompute diagonal lengths before split
+    std::vector<double> precomputedDiagonals;
+    uint32_t face1 = halfEdges[parentHE].face;
+    uint32_t face2 = (oppHE != HalfEdgeMesh::INVALID_INDEX)
+        ? halfEdges[oppHE].face : HalfEdgeMesh::INVALID_INDEX;
+
+#ifndef NDEBUG
+    std::cout << "[splitEdge] Computing diagonals for face1=" << face1
+        << " and face2=" << face2 << std::endl;
+#endif
+
+    double diagLen1 = 0.0;
+    if (face1 != HalfEdgeMesh::INVALID_INDEX) {
+        diagLen1 = mesh.computeSplitDiagonalLength(face1, originalVA, originalVB, splitFraction);
+#ifndef NDEBUG
+        std::cout << "[splitEdge] Face1 (" << face1 << ") diagonal length: " << diagLen1 << std::endl;
+#endif
+    }
+
+    double diagLen2 = 0.0;
+    if (face2 != HalfEdgeMesh::INVALID_INDEX) {
+        diagLen2 = mesh.computeSplitDiagonalLength(face2, originalVA, originalVB, splitFraction);
+#ifndef NDEBUG
+        std::cout << "[splitEdge] Face2 (" << face2 << ") diagonal length: " << diagLen2 << std::endl;
+#endif
+    }
+
+    precomputedDiagonals = { diagLen1, diagLen2 };
+
+    // 5) Topology split
+    edges[edgeIdx].halfEdgeIdx = parentHE;
+    auto R = conn.splitEdgeTopo(edgeIdx, splitFraction);
+    if (R.newV == HalfEdgeMesh::INVALID_INDEX) {
+#ifndef NDEBUG
+        std::cout << "[splitEdge] splitEdgeTopo failed\n";
+#endif
+        return false;
+    }
+
+    uint32_t newV = R.newV;
+    uint32_t diagFront = R.diagFront;
+    uint32_t diagBack = R.diagBack;
+    conn.getVertices()[newV].halfEdgeIdx = R.heB;
+
+    uint32_t heA = R.heA;         // first child of split edge
+    uint32_t heB = R.heB;         // second child of split edge
+    uint32_t dF = diagFront;      // new diagonal front
+    uint32_t dB = diagBack;       // new diagonal back
+
+#ifndef NDEBUG
+    std::cout << "[DEBUG] splitEdgeTopo results: newV=" << newV
+        << ", R.heA=" << R.heA << " (origin=" << halfEdges[R.heA].origin << ")"
+        << ", R.heB=" << R.heB << " (origin=" << halfEdges[R.heB].origin << ")" << std::endl;
+#endif
+
+    // 7) Apply diagonal lengths
+    for (int i = 0; i < 2; ++i) {
+        uint32_t diagHE = (i == 0 ? R.diagFront : R.diagBack);
+        double L = precomputedDiagonals[i];
+        if (diagHE == HalfEdgeMesh::INVALID_INDEX) continue;
+
+        halfEdges[diagHE].intrinsicLength = L;
+        uint32_t opp = halfEdges[diagHE].opposite;
+        if (opp != HalfEdgeMesh::INVALID_INDEX)
+            halfEdges[opp].intrinsicLength = L;
+    }
+
+    // 8) Update geometry in correct order
+#ifndef NDEBUG
+    std::cout << "[splitEdge] Updating intrinsic geometry..." << std::endl;
+#endif
+
+    // First: Update corner angles for the affected faces
+    std::unordered_set<uint32_t> affectedFaces;
+    if (diagFront != HalfEdgeMesh::INVALID_INDEX) {
+        uint32_t frontFace = halfEdges[diagFront].face;
+        if (frontFace != HalfEdgeMesh::INVALID_INDEX) {
+            affectedFaces.insert(frontFace);
+        }
+    }
+    if (diagBack != HalfEdgeMesh::INVALID_INDEX) {
+        uint32_t backFace = halfEdges[diagBack].face;
+        if (backFace != HalfEdgeMesh::INVALID_INDEX) {
+            affectedFaces.insert(backFace);
+        }
+    }
+
+    // Update metric data
+    mesh.updateAllCornerAngles({});
+    mesh.updateAllSignposts();
+    mesh.buildHalfedgeVectorsInVertex();
+    mesh.buildHalfedgeVectorsInFace();
+
+    // 9) Vertex resolution using SurfacePoint
+    auto& verts = conn.getVertices();
+
+    // Set up SurfacePoint for the split location
+    GeodesicTracer::SurfacePoint loc;
+    loc.type = GeodesicTracer::SurfacePoint::Type::EDGE;
+    loc.elementId = edgeIdx;
+    loc.baryCoords = glm::dvec3(1.0 - splitFraction, splitFraction, 0.0);
+
+#ifndef NDEBUG
+    std::cout << "[splitEdge] SurfacePoint on edge "
+        << edgeIdx << " at t=" << splitFraction << std::endl;
+#endif
+
+    // Find 3D position using linear interpolation
+    tracer.resolveVertexLinear(newV, loc, heA, heB);
+#ifndef NDEBUG
+    std::cout << "[splitEdge] Successfully resolved vertex position using linear interpolation\n";
+#endif
+
+    // 10) Track inserted vertex and inserted surface point location
+    insertedLocation[newV] = loc;
+    insertedVertices.insert(newV);
+
+    outNewVertex = newV;
+    outDiagFront = diagFront;
+    outDiagBack = diagBack;
+
+#ifndef NDEBUG
+    std::cout << "[splitEdge] SUCCESS: newV=" << newV
+        << ", diagFront=" << diagFront << ", diagBack=" << diagBack << std::endl;
+#endif
     return true;
 }
 
-bool iODT::isBlockedEdge(const SignpostMesh& mesh, uint32_t edgeIdx) {
-    const auto& conn = mesh.getConnectivity();
-    uint32_t he0 = conn.getEdges()[edgeIdx].halfEdgeIdx;
-    uint32_t v0 = conn.getHalfEdges()[he0].origin;
-    uint32_t v1 = conn.getHalfEdges()[conn.getHalfEdges()[he0].next].origin;
-    auto     p = std::minmax(v0, v1);
-    return (recentlySplit.count(p) > 0);
+bool iODT::computeWeightedCircumcenter(uint32_t vertIdx, uint32_t& outRefFace, int& outLocalRefIdx, glm::dvec2& outAvgVec, double& outAvgLen) {
+    constexpr bool DEBUG = false;
+    const double START_EPS = 1e-6;
+    const double EPS_LEN = 1e-12;
+
+    auto& conn = mesh.getConnectivity();
+    const auto& HEs = conn.getHalfEdges();
+    const auto& hvf = mesh.getHalfedgeVectorsInFace(); // used by rotateVectorAcrossEdge
+
+    outRefFace = HalfEdgeMesh::INVALID_INDEX;
+    outLocalRefIdx = -1;
+    outAvgVec = glm::dvec2(0.0);
+    outAvgLen = 0.0;
+
+    // ring + incident faces
+    std::vector<uint32_t> ringHEs = conn.getVertexHalfEdges(vertIdx);
+    if (ringHEs.empty()) {
+        if (DEBUG) std::cout << "[WCC] vert " << vertIdx << " no halfedges\n";
+        return false;
+    }
+
+    std::vector<uint32_t> incidentFaces;
+    incidentFaces.reserve(ringHEs.size());
+    for (uint32_t he : ringHEs) {
+        if (he == HalfEdgeMesh::INVALID_INDEX) continue;
+        uint32_t f = HEs[he].face;
+        if (f == HalfEdgeMesh::INVALID_INDEX) continue;
+        if (std::find(incidentFaces.begin(), incidentFaces.end(), f) == incidentFaces.end())
+            incidentFaces.push_back(f);
+    }
+    if (incidentFaces.empty()) {
+        if (DEBUG) std::cout << "[WCC] vert " << vertIdx << " has no incident faces\n";
+        return false;
+    }
+
+    // pick reference face & local corner
+    for (uint32_t f : incidentFaces) {
+        auto tri = mesh.layoutTriangle(f);
+        for (int i = 0; i < 3; ++i)
+            if ((uint32_t)tri.indices[i] == vertIdx) {
+                outRefFace = f;
+                outLocalRefIdx = i;
+                break;
+            }
+        if (outRefFace != HalfEdgeMesh::INVALID_INDEX) break;
+    }
+    if (outRefFace == HalfEdgeMesh::INVALID_INDEX) {
+        if (DEBUG) std::cout << "[WCC] vert " << vertIdx << " no reference face\n";
+        return false;
+    }
+
+    // reference corner halfedge (origin == vertIdx)
+    uint32_t heRefCorner = HalfEdgeMesh::INVALID_INDEX;
+    for (uint32_t fhe : conn.getFaceHalfEdges(outRefFace)) {
+        if (fhe != HalfEdgeMesh::INVALID_INDEX && HEs[fhe].origin == vertIdx) {
+            heRefCorner = fhe;
+            break;
+        }
+    }
+    if (heRefCorner == HalfEdgeMesh::INVALID_INDEX) {
+        if (DEBUG) std::cout << "[WCC] vert " << vertIdx << " no heRefCorner\n";
+        return false;
+    }
+
+    // Precompute ref chart->signpost rotation
+    auto triRef = mesh.layoutTriangle(outRefFace);
+    glm::dvec2 eRefChart = hvf.size() == HEs.size()
+        ? hvf[heRefCorner]
+        : (triRef.vertices[(outLocalRefIdx + 1) % 3] - triRef.vertices[outLocalRefIdx]);
+
+    double refChartAngle = std::atan2(eRefChart.y, eRefChart.x);
+    double angleRefCorner = HEs[heRefCorner].signpostAngle;
+
+    auto normPi = [](double a)->double {
+        while (a <= -glm::pi<double>()) a += 2.0 * glm::pi<double>();
+        while (a > glm::pi<double>()) a -= 2.0 * glm::pi<double>();
+        return a;
+        };
+    angleRefCorner = normPi(angleRefCorner);
+    refChartAngle = normPi(refChartAngle);
+    const double rotateChartToRefSignpost = normPi(angleRefCorner - refChartAngle);
+
+    if (DEBUG) {
+        auto triR = mesh.layoutTriangle(outRefFace);
+        
+        // Print info about all incident faces
+        std::cout << "[WCC] vert " << vertIdx << " incident faces (" << incidentFaces.size() << " total):\n";
+        for (uint32_t f : incidentFaces) {
+            double minAngle = computeMinAngle(f);
+            double area = mesh.computeFaceArea(f);
+            auto tri = mesh.layoutTriangle(f);
+            std::cout << "  face " << f << ": min angle=" << (minAngle * 180.0 / glm::pi<double>()) 
+                     << " deg, area=" << area 
+                     << ", vertices=[" << tri.indices[0] << "," << tri.indices[1] << "," << tri.indices[2] << "]\n";
+        }
+    }
+
+    auto rotate2 = [](const glm::dvec2& v, double ang)->glm::dvec2 {
+        double c = std::cos(ang), s = std::sin(ang);
+        return { c * v.x - s * v.y, s * v.x + c * v.y };
+        };
+
+    // transportAroundVertex helper 
+    auto transportAroundVertex = [&](uint32_t startFace, uint32_t heStartCorner,
+        uint32_t targetFace, const glm::dvec2& vecStart)
+        -> std::pair<bool, glm::dvec2>
+        {
+            if (startFace == targetFace) return { true, vecStart };
+            glm::dvec2 bestVec(0.0); bool got = false;
+            struct Attempt { bool forward; };
+            Attempt attempts[2] = { {true},{false} };
+            int ringCap = std::max<int>(8, (int)incidentFaces.size() + 4);
+
+            for (const auto& at : attempts) {
+                uint32_t currFace = startFace;
+                uint32_t heCorner = heStartCorner;
+                glm::dvec2 v = vecStart;
+
+                for (int steps = 0; steps < ringCap && currFace != targetFace; ++steps) {
+                    if (at.forward) {
+                        uint32_t oldHe = heCorner;
+                        uint32_t newHe = HEs[oldHe].opposite;
+                        if (newHe == HalfEdgeMesh::INVALID_INDEX) break;
+                        uint32_t nextFace = HEs[newHe].face;
+                        if (nextFace == HalfEdgeMesh::INVALID_INDEX) break;
+                        v = tracer.rotateVectorAcrossEdge(mesh, currFace, oldHe, nextFace, newHe, v);
+                        uint32_t nextCorner = HEs[newHe].next;
+                        if (nextCorner == HalfEdgeMesh::INVALID_INDEX || HEs[nextCorner].origin != vertIdx) break;
+                        currFace = nextFace; heCorner = nextCorner;
+                    }
+                    else {
+                        uint32_t oldHe = HEs[heCorner].prev;
+                        if (oldHe == HalfEdgeMesh::INVALID_INDEX) break;
+                        uint32_t newHe = HEs[oldHe].opposite;
+                        if (newHe == HalfEdgeMesh::INVALID_INDEX) break;
+                        uint32_t nextFace = HEs[newHe].face;
+                        if (nextFace == HalfEdgeMesh::INVALID_INDEX) break;
+                        v = tracer.rotateVectorAcrossEdge(mesh, currFace, oldHe, nextFace, newHe, v);
+                        uint32_t nextCorner = newHe;
+                        if (HEs[nextCorner].origin != vertIdx) break;
+                        currFace = nextFace; heCorner = nextCorner;
+                    }
+                }
+                if (currFace == targetFace) { bestVec = v; got = true; break; }
+            }
+            return { got, bestVec };
+        };
+
+    glm::dvec2 accum(0.0);
+    double accumW = 0.0;
+    int successCount = 0;
+
+    for (uint32_t f : incidentFaces) {
+        double area = mesh.computeFaceArea(f);
+        if (!(area > 0.0)) continue;
+
+        auto tri = mesh.layoutTriangle(f);
+        glm::dvec2 cc2d = mesh.computeCircumcenter2D(
+            tri.vertices[0], tri.vertices[1], tri.vertices[2]);
+        if (!std::isfinite(cc2d.x) || !std::isfinite(cc2d.y)) continue;
+
+        int localIdx = -1;
+        for (int i = 0; i < 3; ++i)
+            if ((uint32_t)tri.indices[i] == vertIdx) { localIdx = i; break; }
+        if (localIdx < 0) continue;
+
+        glm::dvec3 startBary(START_EPS, START_EPS, START_EPS);
+        startBary[localIdx] = 1.0 - 2.0 * START_EPS;
+
+        glm::dvec2 vCorner = tri.vertices[localIdx];
+        glm::dvec2 dir = cc2d - vCorner;
+        double L = glm::length(dir);
+        if (L <= EPS_LEN) continue;
+        glm::dvec2 dirN = dir / L;
+
+        auto tr = tracer.traceFromFace(f, startBary, dirN, L);
+        if (!tr.success || tr.finalFaceIdx == GeodesicTracer::INVALID_INDEX) continue;
+
+        auto triExit = mesh.layoutTriangle(tr.finalFaceIdx);
+
+        // displacement = weighted sum of (Vi - Vcorner) using baryCoords, no absolute chart
+        int localExit = -1;
+        // If we hit an edge, try to find the vertex in one of the adjacent faces
+        if (tr.exitPoint.type == GeodesicTracer::SurfacePoint::Type::EDGE) {
+            uint32_t edgeIdx = tr.exitPoint.elementId;
+            auto& edges = conn.getEdges();
+            if (edgeIdx < edges.size()) {
+                uint32_t he = edges[edgeIdx].halfEdgeIdx;
+                if (he != HalfEdgeMesh::INVALID_INDEX) {
+                    // Try both faces adjacent to the edge
+                    uint32_t face1 = HEs[he].face;
+                    uint32_t face2 = HalfEdgeMesh::INVALID_INDEX;
+
+                    // Safely get the opposite face
+                    uint32_t oppHe = HEs[he].opposite;
+                    if (oppHe != HalfEdgeMesh::INVALID_INDEX) {
+                        face2 = HEs[oppHe].face;
+                    }
+
+                    // Validate and get edge endpoints
+                    uint32_t v0 = HEs[he].origin;
+                    uint32_t nextHe = HEs[he].next;
+                    if (nextHe == HalfEdgeMesh::INVALID_INDEX) continue;
+                    uint32_t v1 = HEs[nextHe].origin;
+
+                    // Validate and clamp split parameter
+                    double t = tr.exitPoint.split;
+                    if (!std::isfinite(t)) continue;
+                    t = glm::clamp(t, 0.0, 1.0);
+
+                    uint32_t chosenFace = HalfEdgeMesh::INVALID_INDEX;
+                    glm::dvec3 useBary(0.0);
+                    auto chosenLayout = triExit; // Use same type as triExit
+                    int chosenLocalExit = -1;
+
+                    // Check first face
+                    if (face1 != HalfEdgeMesh::INVALID_INDEX) {
+                        auto triFace1 = mesh.layoutTriangle(face1);
+                        // Find local indices for edge endpoints in this face
+                        int local_v0 = -1, local_v1 = -1;
+                        for (int i = 0; i < 3; ++i) {
+                            if ((uint32_t)triFace1.indices[i] == v0) local_v0 = i;
+                            if ((uint32_t)triFace1.indices[i] == v1) local_v1 = i;
+                            if ((uint32_t)triFace1.indices[i] == vertIdx) chosenLocalExit = i;
+                        }
+                        if (local_v0 >= 0 && local_v1 >= 0 && chosenLocalExit >= 0) {
+                            // Compute proper barycentric coordinates using local indices
+                            glm::dvec2 edgePos = triFace1.vertices[local_v0] * (1.0 - t) +
+                                triFace1.vertices[local_v1] * t;
+                            useBary = mesh.computeBarycentric2D(edgePos,
+                                triFace1.vertices[0],
+                                triFace1.vertices[1],
+                                triFace1.vertices[2]);
+                            chosenFace = face1;
+                            chosenLayout = triFace1;
+                            localExit = chosenLocalExit;
+                        }
+                    }
+
+                    // If not found, check second face
+                    if (localExit < 0 && face2 != HalfEdgeMesh::INVALID_INDEX) {
+                        auto triFace2 = mesh.layoutTriangle(face2);
+                        // Find local indices for edge endpoints in this face
+                        int local_v0 = -1, local_v1 = -1;
+                        for (int i = 0; i < 3; ++i) {
+                            if ((uint32_t)triFace2.indices[i] == v0) local_v0 = i;
+                            if ((uint32_t)triFace2.indices[i] == v1) local_v1 = i;
+                            if ((uint32_t)triFace2.indices[i] == vertIdx) chosenLocalExit = i;
+                        }
+                        if (local_v0 >= 0 && local_v1 >= 0 && chosenLocalExit >= 0) {
+                            // Compute proper barycentric coordinates using local indices
+                            glm::dvec2 edgePos = triFace2.vertices[local_v0] * (1.0 - t) +
+                                triFace2.vertices[local_v1] * t;
+                            useBary = mesh.computeBarycentric2D(edgePos,
+                                triFace2.vertices[0],
+                                triFace2.vertices[1],
+                                triFace2.vertices[2]);
+                            chosenFace = face2;
+                            chosenLayout = triFace2;
+                            localExit = chosenLocalExit;
+                        }
+                    }
+
+                    // Apply changes only if we found a valid face
+                    if (chosenFace != HalfEdgeMesh::INVALID_INDEX) {
+                        tr.finalFaceIdx = chosenFace;
+                        tr.baryCoords = useBary;
+                        triExit = chosenLayout;
+                    }
+                }
+            }
+        }
+        else {
+            // Normal case: check the exit face
+            for (int i = 0; i < 3; ++i)
+                if ((uint32_t)triExit.indices[i] == vertIdx) { localExit = i; break; }
+        }
+        if (localExit < 0) continue;        glm::dvec2 dispInExit(0.0);
+        for (int i = 0; i < 3; ++i) {
+            if (i == localExit) continue;
+            dispInExit += tr.baryCoords[i] * (triExit.vertices[i] - triExit.vertices[localExit]);
+        }
+        if (!std::isfinite(dispInExit.x) || !std::isfinite(dispInExit.y)) continue;
+        if (glm::length(dispInExit) <= EPS_LEN) continue;
+
+        uint32_t heExitCorner = HalfEdgeMesh::INVALID_INDEX;
+        for (uint32_t fhe : conn.getFaceHalfEdges(tr.finalFaceIdx)) {
+            if (fhe != HalfEdgeMesh::INVALID_INDEX && HEs[fhe].origin == vertIdx) {
+                heExitCorner = fhe; break;
+            }
+        }
+        if (heExitCorner == HalfEdgeMesh::INVALID_INDEX) continue;
+
+        auto [ok, dispInRefChart] = transportAroundVertex(
+            tr.finalFaceIdx, heExitCorner, outRefFace, dispInExit);
+
+        if (!ok) {
+            double angleExitCorner = normPi(HEs[heExitCorner].signpostAngle);
+            double delta = normPi(angleRefCorner - angleExitCorner);
+            dispInRefChart = rotate2(dispInExit, delta);
+            if (DEBUG) {
+                std::cout << "  [WCC] face " << f
+                    << " transport FAIL -> fallback corner delta=" << delta
+                    << " heExitCorner=" << heExitCorner
+                    << " finalFace=" << tr.finalFaceIdx << "\n";
+            }
+        }
+
+        glm::dvec2 dispInRefSignpost = rotate2(dispInRefChart, rotateChartToRefSignpost);
+        double dispLen = glm::length(dispInRefSignpost);
+        if (dispLen <= EPS_LEN) continue;
+
+            if (DEBUG) {
+#ifndef NDEBUG
+                std::cout << "  [WCC] face " << f
+                    << " area=" << area
+                    << " tr.finalFace=" << tr.finalFaceIdx
+                    << " heExitCorner=" << heExitCorner
+                    << " dispLen=" << dispLen
+                    << " (transported & signpost-aligned)\n";
+#endif
+            }        accum += area * dispInRefSignpost;
+        accumW += area;
+        ++successCount;
+    }
+
+    if (!(accumW > 0.0) || successCount == 0) {
+        if (DEBUG) std::cout << "[WCC] vert " << vertIdx
+            << " no successful contributions\n";
+        return false;
+    }
+
+    outAvgVec = accum / accumW;
+    outAvgLen = glm::length(outAvgVec);
+
+    if (DEBUG) {
+        std::cout << "[WCC] vert " << vertIdx
+            << " successCount=" << successCount
+            << " outAvgVec=(" << outAvgVec.x << "," << outAvgVec.y << ")"
+            << " outAvgLen=" << outAvgLen << "\n";
+    }
+    return true;
 }
 
-float iODT::computeMinAngle(const SignpostMesh& mesh, uint32_t faceIdx) {
+bool iODT::traceWeightedVector(uint32_t vertIdx, double stepLen, GeodesicTracer::GeodesicTraceResult& outTrace) {
+    constexpr bool DEBUG = true;
+    const double START_EPS = 1e-8;
+
+    uint32_t refFace;
+    int localRefIdx;
+    glm::dvec2 avgVec;
+    double avgLen;
+
+    if (!computeWeightedCircumcenter(vertIdx, refFace, localRefIdx, avgVec, avgLen)) {
+        outTrace.success = false;
+        return false;
+    }
+
+    if (avgLen <= 0.0) {
+        outTrace.success = false;
+        return false;
+    }
+
+    glm::dvec2 dir = avgVec / avgLen;
+
+    glm::dvec3 startBary(START_EPS, START_EPS, START_EPS);
+    startBary[localRefIdx] = 1.0 - 2.0 * START_EPS;
+
+    outTrace = tracer.traceFromFace(refFace, startBary, dir, stepLen);
+
+    if (DEBUG) {
+        if (outTrace.success && outTrace.finalFaceIdx != GeodesicTracer::INVALID_INDEX) {
+            auto triExit = mesh.layoutTriangle(outTrace.finalFaceIdx);
+            glm::dvec2 exitChart = triExit.vertices[0] * outTrace.baryCoords.x
+                + triExit.vertices[1] * outTrace.baryCoords.y
+                + triExit.vertices[2] * outTrace.baryCoords.z;
+            glm::dvec2 exitInRef = (outTrace.finalFaceIdx == refFace)
+                ? exitChart
+                : tracer.chartLocal2D(mesh, outTrace.finalFaceIdx, refFace, exitChart);
+#ifndef NDEBUG
+            std::cout << "[traceWeightedVector] vert=" << vertIdx
+                << " stepLen=" << stepLen
+                << " exitInRef=(" << exitInRef.x << "," << exitInRef.y << ")\n";
+#endif
+        }
+        else {
+#ifndef NDEBUG
+            std::cout << "[traceWeightedVector] trace failed for vert=" << vertIdx << "\n";
+#endif
+        }
+    }
+
+    return outTrace.success;
+}
+
+double iODT::computeMinAngle(uint32_t faceIdx) {
     const auto& conn = mesh.getConnectivity();
     const auto& faces = conn.getFaces();
     const auto& halfEdges = conn.getHalfEdges();
@@ -651,183 +1267,30 @@ float iODT::computeMinAngle(const SignpostMesh& mesh, uint32_t faceIdx) {
     }
 
     // Get the edge lengths directly from the halfedges
-    float a = halfEdges[faceEdges[0]].intrinsicLength;
-    float b = halfEdges[faceEdges[1]].intrinsicLength;
-    float c = halfEdges[faceEdges[2]].intrinsicLength;
+    double a = halfEdges[faceEdges[0]].intrinsicLength;
+    double b = halfEdges[faceEdges[1]].intrinsicLength;
+    double c = halfEdges[faceEdges[2]].intrinsicLength;
 
-    // Clamp minimum positive length 
-    a = std::max(a, 1e-5f);
-    b = std::max(b, 1e-5f);
-    c = std::max(c, 1e-5f);
+    // Ensure minimum positive length for numerical stability
+    a = std::max(a, 1e-5);
+    b = std::max(b, 1e-5);
+    c = std::max(c, 1e-5);
 
     // Compute angles using the law of cosines
-    float cosA = (b * b + c * c - a * a) / (2.0f * b * c);
-    float cosB = (a * a + c * c - b * b) / (2.0f * a * c);
-    float cosC = (a * a + b * b - c * c) / (2.0f * a * b);
+    double cosA = (b * b + c * c - a * a) / (2.0f * b * c);
+    double cosB = (a * a + c * c - b * b) / (2.0f * a * c);
+    double cosC = (a * a + b * b - c * c) / (2.0f * a * b);
 
     // Clamp to valid range to avoid numerical issues
-    cosA = glm::clamp(cosA, -1.0f, 1.0f);
-    cosB = glm::clamp(cosB, -1.0f, 1.0f);
-    cosC = glm::clamp(cosC, -1.0f, 1.0f);
+    cosA = glm::clamp(cosA, -1.0, 1.0);
+    cosB = glm::clamp(cosB, -1.0, 1.0);
+    cosC = glm::clamp(cosC, -1.0, 1.0);
 
     // Convert to angles
-    float angleA = std::acos(cosA);
-    float angleB = std::acos(cosB);
-    float angleC = std::acos(cosC);
+    double angleA = std::acos(cosA);
+    double angleB = std::acos(cosB);
+    double angleC = std::acos(cosC);
 
     // Return the minimum angle
     return std::min(std::min(angleA, angleB), angleC);
-}
-
-glm::vec3 iODT::computeWeightedCircumcenterVector(const SignpostMesh& mesh, uint32_t vertIdx) {
-    const auto& conn = mesh.getConnectivity();
-    const auto& halfEdges = conn.getHalfEdges();
-    const auto& vertices = conn.getVertices();
-
-    if (vertIdx >= vertices.size()) {
-        return glm::vec3(0.0f);
-    }
-
-    // Get the first halfedge from this vertex
-    uint32_t firstHalfEdge = vertices[vertIdx].halfEdgeIdx;
-    if (firstHalfEdge == HalfEdgeMesh::INVALID_INDEX) {
-        return glm::vec3(0.0f);
-    }
-
-    // Skip boundary vertices
-    if (conn.isBoundaryVertex(vertIdx)) {
-        return glm::vec3(0.0f);
-    }
-
-    // Find incident triangles
-    std::unordered_set<uint32_t> incidentFaces;
-    std::vector<uint32_t> vertexHalfEdges = conn.getVertexHalfEdges(vertIdx);
-
-    for (uint32_t heIdx : vertexHalfEdges) {
-        uint32_t faceIdx = halfEdges[heIdx].face;
-        if (faceIdx != HalfEdgeMesh::INVALID_INDEX) {
-            incidentFaces.insert(faceIdx);
-        }
-    }
-
-    // Calculate intrinsic circumcenters and weights
-    std::vector<glm::vec3> circumcenterVectors;
-    std::vector<float> weights;
-
-    // Get the 3D position of our target vertex
-    glm::vec3 targetPos = vertices[vertIdx].position;
-
-    for (uint32_t faceIdx : incidentFaces) {
-        // Get the three halfedges of the face
-        std::vector<uint32_t> faceEdges = conn.getFaceHalfEdges(faceIdx);
-        if (faceEdges.size() != 3) continue;
-
-        // Get the three vertices
-        uint32_t v1 = halfEdges[faceEdges[0]].origin;
-        uint32_t v2 = halfEdges[faceEdges[1]].origin;
-        uint32_t v3 = halfEdges[faceEdges[2]].origin;
-
-        // Skip if this vertex is not part of the face
-        if (v1 != vertIdx && v2 != vertIdx && v3 != vertIdx) {
-            continue;
-        }
-
-        // Compute triangle area using face area method (more robust)
-        float area = mesh.computeFaceArea(faceIdx);
-        if (area < 1e-6f) continue; // Skip degenerate triangles
-
-        // Get intrinsic circumcenter of the triangle
-        glm::vec3 circumcenter = mesh.computeIntrinsicCircumcenter(faceIdx);
-
-        // Check for valid circumcenter
-        if (!std::isfinite(circumcenter.x) || !std::isfinite(circumcenter.y) || !std::isfinite(circumcenter.z)) {
-            continue;
-        }
-
-        // Get vector pointing from this vertex to the circumcenter
-        glm::vec3 ccVector = circumcenter - targetPos;
-
-        // Use triangle area as weight
-        circumcenterVectors.push_back(ccVector);
-        weights.push_back(area);
-    }
-
-    // Compute weighted average direction
-    glm::vec3 avgDirection(0.0f);
-    float totalWeight = 0.0f;
-
-    for (size_t i = 0; i < circumcenterVectors.size(); i++) {
-        avgDirection += circumcenterVectors[i] * weights[i];
-        totalWeight += weights[i];
-    }
-
-    if (totalWeight > 0.0f) {
-        avgDirection /= totalWeight;
-    }
-
-    return avgDirection;
-}
-
-bool iODT::validateMeshConnectivity(const SignpostMesh& mesh) {
-    const auto& conn = mesh.getConnectivity();
-    const auto& vertices = conn.getVertices();
-    const auto& halfEdges = conn.getHalfEdges();
-
-    std::cout << "[iODT] Validating mesh connectivity..." << std::endl;
-
-    // Check for disconnected components using BFS
-    std::vector<bool> visited(vertices.size(), false);
-    int componentCount = 0;
-
-    for (uint32_t startVertex = 0; startVertex < vertices.size(); ++startVertex) {
-        if (visited[startVertex] || vertices[startVertex].halfEdgeIdx == HalfEdgeMesh::INVALID_INDEX) {
-            continue;
-        }
-
-        // BFS from this vertex
-        std::queue<uint32_t> queue;
-        queue.push(startVertex);
-        visited[startVertex] = true;
-        int componentSize = 0;
-
-        while (!queue.empty()) {
-            uint32_t currentVertex = queue.front();
-            queue.pop();
-            componentSize++;
-
-            // Get all halfedges from this vertex
-            std::vector<uint32_t> vertexHalfEdges = conn.getVertexHalfEdges(currentVertex);
-
-            for (uint32_t heIdx : vertexHalfEdges) {
-                if (heIdx >= halfEdges.size()) continue;
-
-                // Get the destination vertex of this halfedge
-                uint32_t nextHE = halfEdges[heIdx].next;
-                if (nextHE >= halfEdges.size()) continue;
-
-                uint32_t destVertex = halfEdges[nextHE].origin;
-                if (destVertex < vertices.size() && !visited[destVertex]) {
-                    visited[destVertex] = true;
-                    queue.push(destVertex);
-                }
-            }
-        }
-
-        std::cout << "  Component " << componentCount << ": " << componentSize << " vertices" << std::endl;
-        componentCount++;
-    }
-
-    // Count unvisited vertices
-    int unvisitedCount = 0;
-    for (size_t i = 0; i < visited.size(); ++i) {
-        if (!visited[i]) {
-            std::cout << "  Unvisited vertex: " << i << std::endl;
-            unvisitedCount++;
-        }
-    }
-
-    std::cout << "  Total components: " << componentCount << std::endl;
-    std::cout << "  Unvisited vertices: " << unvisitedCount << std::endl;
-
-    return componentCount == 1 && unvisitedCount == 0;
 }

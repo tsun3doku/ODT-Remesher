@@ -2,14 +2,15 @@
 #include <glm/glm.hpp>
 #include <set>
 
+#include "GeodesicTracer.hpp"
+#include "SignPostMesh.hpp"
 #include "Model.hpp"
 #include "Structs.hpp"
 
-class SignpostMesh;
 
 class iODT {
 public:
-    iODT(Model& model);
+    iODT(Model& model, SignpostMesh& mesh);
 
     static const uint32_t INVALID_INDEX = static_cast<uint32_t>(-1);
 
@@ -17,7 +18,14 @@ public:
         CIRCUMCENTER_INSERTION,
         EDGE_SPLIT
     };
-
+    struct pair_hash {
+        template <class T1, class T2>
+        std::size_t operator()(const std::pair<T1, T2>& p) const {
+            auto h1 = std::hash<T1>{}(p.first);
+            auto h2 = std::hash<T2>{}(p.second);
+            return h1 ^ (h2 << 1);
+        }
+    };
     struct RefinementCandidate {
         RefinementType type;
         uint32_t faceIdx        = 0;
@@ -29,34 +37,29 @@ public:
     };
 
     // High level ODT functions
-    bool optimalDelaunayTriangulation(SignpostMesh& mesh, int iterations);
-    void repositionInsertedVertices(SignpostMesh& mesh, int iterations, double tol);
+    bool optimalDelaunayTriangulation(int iterations);
+    void repositionInsertedVertices(int iterations, double tol, double maxEdgeLength);
 
     // Refinement operations
-    bool delaunayRefinement(SignpostMesh& mesh);
-    std::vector<RefinementCandidate> findRefinementCandidates(const SignpostMesh& mesh, float minAngleThreshold, float maxAreaThreshold);
-    bool insertCircumcenter(SignpostMesh& mesh, uint32_t faceIdx, uint32_t& outNewVertex);
-    bool splitEdge(SignpostMesh& mesh, uint32_t edgeIdx, uint32_t& outNewVertex);
-    bool isBlockedEdge(const SignpostMesh& mesh, uint32_t edgeIdx);
-
-    // Quality metrics
-    float computeMinAngle(const SignpostMesh& mesh, uint32_t faceIdx);
+    bool delaunayRefinement();
+    std::vector<RefinementCandidate> findRefinementCandidates( float minAngleThreshold, float maxAreaThreshold);
+    bool insertCircumcenter(uint32_t faceIdx, uint32_t& outNewVertex);
+    bool splitEdge(uint32_t edgeIdx, uint32_t& outNewVertex, uint32_t& outDiagFront, uint32_t& outDiagBack, uint32_t HESplit, double t = 0.5);
 
     // Helpers
-    glm::vec3 computeWeightedCircumcenterVector(const SignpostMesh& mesh, uint32_t vertIdx);
+    bool computeWeightedCircumcenter(uint32_t vertIdx, uint32_t& outRefFace, int& outLocalRefIdx, glm::dvec2& outAvgVec, double& outAvgLen);
+    bool traceWeightedVector(uint32_t vertIdx, double stepLen, GeodesicTracer::GeodesicTraceResult& outTrace);
 
-    // Validation
-    bool validateMeshConnectivity(const SignpostMesh& mesh);
+    // Quality metrics
+    double computeMinAngle( uint32_t faceIdx);
+
 
 private:
     Model& model;
+    SignpostMesh& mesh;
+    GeodesicTracer tracer;
+
     std::set<std::pair<uint32_t, uint32_t>> recentlySplit;
-
-    // Track inserted vertices for ODT repositioning
     std::unordered_set<uint32_t> insertedVertices;
-
-    // Feature preservation
-    bool isFeatureVertex(const SignpostMesh& mesh, uint32_t vertIdx);
-    bool isFeatureEdge(const SignpostMesh& mesh, uint32_t signpostIdx);
-    void preserveFeatures(SignpostMesh& mesh);
+    std::unordered_map<uint32_t, GeodesicTracer::SurfacePoint> insertedLocation;
 };

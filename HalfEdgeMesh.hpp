@@ -37,8 +37,7 @@ public:
 		uint32_t opposite		= INVALID_INDEX;
 		uint32_t face			= INVALID_INDEX;
 
-		// Geometric data
-		float cornerAngle		= 0.0f;
+		double cornerAngle		= 0.0;
 		double intrinsicLength	= 0.0;  
 		double signpostAngle	= 0.0;    
 		bool isFeature			= false;
@@ -46,11 +45,11 @@ public:
 	};
 
 	struct Split {
-		uint32_t newV;
-		// Left halfedge child
-		uint32_t heA;
-		// Right halfedge child
-		uint32_t heB;
+		uint32_t newV			= INVALID_INDEX;
+		uint32_t heA			= INVALID_INDEX;	
+		uint32_t heB			= INVALID_INDEX;	
+		uint32_t diagFront		= INVALID_INDEX;
+		uint32_t diagBack		= INVALID_INDEX;
 	};
 
 	struct pair_hash {
@@ -68,6 +67,7 @@ public:
 	void initializeIntrinsicLengths();
 	void rebuildEdges();
 	void rebuildConnectivity();
+	void rebuildFaceConnectivity(uint32_t faceIdx);
 	void rebuildOpposites();
 	void updateIntrinsicLength(uint32_t heIdx);
 	std::array<glm::dvec2,4> layoutDiamond(uint32_t heIdx) const;
@@ -84,6 +84,7 @@ public:
 	uint32_t insertVertexAlongEdge(uint32_t edgeIdx);
 	uint32_t connectVertices(uint32_t heA, uint32_t heB);
 	Split splitEdgeTopo(uint32_t edgeIdx, double t);
+	void removeVertex(uint32_t v);
 
 	std::vector<uint32_t> getVertexHalfEdges(uint32_t vertexIdx) const;
 	std::vector<uint32_t> getFaceHalfEdges(uint32_t faceIdx) const;
@@ -105,7 +106,7 @@ public:
 	}
 	
 	// Getters
-	std::vector<HalfEdge>& getHalfEdges() {  // Non-const
+	std::vector<HalfEdge>& getHalfEdges() {  
 		return halfEdges;
 	}
 	const std::vector<HalfEdge>& getHalfEdges() const {
@@ -114,30 +115,33 @@ public:
 	const std::vector<Vertex>& getVertices() const {
 		return vertices;
 	}
-	std::vector<Vertex>& getVertices() {	 // Non-const
+	std::vector<Vertex>& getVertices() {	 
 		return vertices;
 	}
 	const std::vector<Edge>& getEdges() const {
 		return edges;
 	}
-	std::vector<Edge>& getEdges() {			 // Non-const
+	std::vector<Edge>& getEdges() {			 
 		return edges;
 	}
 	const std::vector<Face>& getFaces() const {
 		return faces;
 	}
-
-	uint32_t getEdgeIndexFromHalfEdge(uint32_t halfEdgeIdx) const;
-
-	std::vector<glm::vec3> getVertexPositions() const;
+	std::vector<Face>& getFaces() {
+		return faces;
+	}
 
 	glm::vec3 getPositionFromHalfEdge(uint32_t halfEdgeIdx) const {
 		return vertices[halfEdges[halfEdgeIdx].origin].position;
 	}
 
-	float getIntrinsicLengthFromHalfEdge(uint32_t halfEdgeIdx) const {
-		return halfEdgeIdx < halfEdges.size() ? halfEdges[halfEdgeIdx].intrinsicLength : 0.0f;
+	double getIntrinsicLengthFromHalfEdge(uint32_t halfEdgeIdx) const {
+		return halfEdgeIdx < halfEdges.size() ? halfEdges[halfEdgeIdx].intrinsicLength : 0.0;
 	}
+
+	uint32_t getEdgeIndexFromHalfEdge(uint32_t halfEdgeIdx) const;
+
+	std::vector<glm::vec3> getVertexPositions() const;
 
 	// Setters
 	void setVertexPositions(const std::vector<glm::vec3>& newPositions);
